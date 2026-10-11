@@ -1,0 +1,3 @@
+kubernetes/*.crt
+kubernetes/*.key
+.DS_Store

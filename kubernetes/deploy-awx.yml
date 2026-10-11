@@ -1,0 +1,364 @@
+---
+- name: Deploy AWX on Kubernetes
+  hosts: awx_host
+  gather_facts: false
+  vars_prompt:
+    - name: hostname
+      prompt: "Enter the hostname (e.g., awx.example.com)"
+      private: false
+
+    - name: awx_version
+      prompt: "Enter the AWX Operator version (e.g., 2.19.1)"
+      private: false
+
+    - name: use_script_folder
+      prompt: "Are the certificate and key files located in the playbook folder? (y/n)"
+      private: false
+
+    - name: cert_file_input
+      prompt: "Enter the certificate file name or path (on this machine, not the remote host)"
+      private: false
+
+    - name: key_file_input
+      prompt: "Enter the key file name or path (on this machine, not the remote host)"
+      private: false
+
+  vars:
+    namespace: awx
+    # Optional shell snippet on the target host that exports http_proxy/https_proxy/no_proxy.
+    # Sourced before tasks that reach the internet (k3s install, kustomize, git clone),
+    # since Ansible's shell module never sources /etc/profile.d itself. Skipped if absent.
+    proxy_env_file: /etc/profile.d/proxy.sh
+    # Paths below are resolved on the controller (where ansible-playbook runs), since
+    # vars_prompt is answered by whoever invokes the playbook, not the remote AWX host.
+    cert_file: "{{ cert_file_input if use_script_folder|lower != 'y' else playbook_dir + '/' + cert_file_input }}"
+    key_file: "{{ key_file_input if use_script_folder|lower != 'y' else playbook_dir + '/' + key_file_input }}"
+    # Well-defined working directory on the remote AWX host. Everything the remote
+    # kubectl/kustomize commands need (awx.yml, the generated kustomization.yaml, the
+    # copied cert/key, the generated ingress manifest) is placed here explicitly, since
+    # the controller and the remote host are different machines/filesystems.
+    deploy_dir: "~/awx-deploy"
+    # Must match metadata.name in kubernetes/awx.yml; used to wait for the AWX
+    # deployment the operator creates from that custom resource.
+    awx_instance_name: awx
+
+  tasks:
+    - name: Check if K3s kubeconfig exists
+      stat:
+        path: /etc/rancher/k3s/k3s.yaml
+      register: k3s_kubeconfig
+
+    - name: Check if kubectl is installed
+      command: which kubectl
+      register: kubectl_check
+      failed_when: false
+      changed_when: false
+
+    - name: Check if k3s binary is installed
+      command: which k3s
+      register: k3s_binary_check
+      failed_when: false
+      changed_when: false
+
+    - name: Check if curl is installed (required for K3s install)
+      command: which curl
+      register: curl_check
+      failed_when: false
+      changed_when: false
+      when: not k3s_kubeconfig.stat.exists
+
+    - name: Fail if curl is missing and Kubernetes install is required
+      fail:
+        msg: "curl is required to install Kubernetes (K3s). Please install curl and retry."
+      when:
+        - not k3s_kubeconfig.stat.exists
+        - curl_check.rc != 0
+
+    - name: Install K3s when Kubernetes is not set up (skips if already installed)
+      # proxy_env_file sets the web proxy for login shells, but Ansible's
+      # shell/command modules run non-interactively and never source
+      # /etc/profile.d, so without this the curl below hangs on hosts with no
+      # direct internet route. Sourcing it here (rather than hardcoding the
+      # proxy address) also reuses any no-proxy logic it has. If the
+      # proxy vars end up set, the k3s installer bakes them into the systemd
+      # unit it generates, so containerd's later image pulls use them too.
+      shell: |
+        [ -f {{ proxy_env_file }} ] && . {{ proxy_env_file }}
+        curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644
+      args:
+        creates: /etc/rancher/k3s/k3s.yaml
+      become: true
+      when: not k3s_kubeconfig.stat.exists
+
+    - name: Refresh K3s kubeconfig status
+      stat:
+        path: /etc/rancher/k3s/k3s.yaml
+      register: k3s_kubeconfig
+
+    - name: Check if the k3s systemd environment file exists
+      stat:
+        path: /etc/systemd/system/k3s.service.env
+      register: k3s_service_env_stat
+
+    # The k3s installer bakes http_proxy/https_proxy/no_proxy from the shell that
+    # ran it (see the "Install K3s" task) into this file. Some proxy setups
+    # set no_proxy with bare IPs (e.g. "10.0.0.0") instead of CIDRs, and Go's HTTP client treats a bare IP as an exact match,
+    # not a subnet. That breaks k3s's own outbound HTTP client, including the API
+    # server proxying `kubectl logs`/`exec` to the kubelet, which then gets sent
+    # through the proxy and 502s. Reuse the same corrected NO_PROXY as awx.yml
+    # (adjust both to your network).
+    - name: Fix k3s systemd environment's NO_PROXY to use CIDR notation
+      lineinfile:
+        path: /etc/systemd/system/k3s.service.env
+        regexp: '^no_proxy='
+        line: "no_proxy='localhost,127.0.0.1,.example.com,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'"
+      register: k3s_env_fixed
+      when: k3s_service_env_stat.stat.exists
+
+    - name: Restart k3s to apply corrected proxy environment
+      command: systemctl restart k3s
+      when: k3s_env_fixed.changed | default(false)
+
+    - name: Check firewalld status
+      command: firewall-cmd --state
+      register: firewalld_state
+      failed_when: false
+      changed_when: false
+
+    # firewalld's default "public" zone drops forwarded traffic and has no
+    # masquerade, which blocks pod-to-pod communication over the CNI bridge
+    # (e.g. AWX web/task pods reaching postgres) even though it never leaves
+    # the host, plus external access to the AWX ingress. Rather than disabling
+    # firewalld, open exactly what k3s and the Traefik ingress need, per
+    # Rancher's documented firewalld setup for k3s.
+    - name: Trust the Kubernetes pod and service networks in firewalld
+      command: "firewall-cmd --permanent --zone=trusted --add-source={{ item }}"
+      loop:
+        - "10.42.0.0/16"  # default k3s pod (cluster) CIDR
+        - "10.43.0.0/16"  # default k3s service CIDR
+      register: firewalld_add_source
+      changed_when: "'ALREADY_ENABLED' not in (firewalld_add_source.stderr | default(''))"
+      when: firewalld_state.rc == 0
+
+    - name: Open the Kubernetes API and ingress ports in firewalld
+      command: "firewall-cmd --permanent --add-port={{ item }}"
+      loop:
+        - "6443/tcp"  # Kubernetes API server
+        - "80/tcp"    # Traefik ingress (HTTP)
+        - "443/tcp"   # Traefik ingress (HTTPS)
+      register: firewalld_add_port
+      changed_when: "'ALREADY_ENABLED' not in (firewalld_add_port.stderr | default(''))"
+      when: firewalld_state.rc == 0
+
+    - name: Reload firewalld to apply changes
+      command: firewall-cmd --reload
+      when:
+        - firewalld_state.rc == 0
+        - firewalld_add_source.changed or firewalld_add_port.changed
+
+    - name: Re-check if kubectl is installed
+      command: which kubectl
+      register: kubectl_recheck
+      failed_when: false
+      changed_when: false
+
+    - name: Re-check if k3s binary is installed
+      command: which k3s
+      register: k3s_binary_recheck
+      failed_when: false
+      changed_when: false
+
+    - name: Fail if Kubernetes CLI is still missing
+      fail:
+        msg: "Neither kubectl nor k3s is available after Kubernetes setup."
+      when:
+        - kubectl_recheck.rc != 0
+        - k3s_binary_recheck.rc != 0
+
+    - name: Set kubectl command
+      set_fact:
+        kubectl_cmd: >-
+          {{
+            'kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml'
+            if (k3s_kubeconfig.stat.exists and kubectl_recheck.rc == 0)
+            else ('k3s kubectl' if k3s_binary_recheck.rc == 0 else 'kubectl')
+          }}
+
+    - name: Wait for Kubernetes API to be reachable
+      command: "{{ kubectl_cmd }} get nodes"
+      register: k8s_ready
+      retries: 12
+      delay: 10
+      until: k8s_ready.rc == 0
+      changed_when: false
+
+    - name: Check if certificate file exists (on the controller)
+      stat:
+        path: "{{ cert_file }}"
+      register: cert_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Check if key file exists (on the controller)
+      stat:
+        path: "{{ key_file }}"
+      register: key_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Fail if certificate or key file not found
+      fail:
+        msg: "Certificate or key file not found at the specified path on this machine."
+      when: not cert_stat.stat.exists or not key_stat.stat.exists
+
+    - name: Create remote deploy directory
+      file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Copy AWX custom resource definition to the remote host
+      copy:
+        src: "{{ playbook_dir }}/awx.yml"
+        dest: "{{ deploy_dir }}/awx.yml"
+        mode: "0600"
+
+    - name: Copy certificate file to the remote host
+      copy:
+        src: "{{ cert_file }}"
+        dest: "{{ deploy_dir }}/tls.crt"
+        mode: "0600"
+
+    - name: Copy key file to the remote host
+      copy:
+        src: "{{ key_file }}"
+        dest: "{{ deploy_dir }}/tls.key"
+        mode: "0600"
+
+    - name: Check if AWX namespace exists
+      command: "{{ kubectl_cmd }} get namespace {{ namespace }}"
+      register: namespace_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create AWX namespace
+      command: "{{ kubectl_cmd }} create namespace {{ namespace }}"
+      when: namespace_check.rc != 0
+
+    - name: Create kustomization.yaml for the AWX operator
+      copy:
+        content: |
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            # Find the latest tag here: https://github.com/ansible/awx-operator/releases
+            - github.com/ansible/awx-operator/config/default?ref={{ awx_version }}
+          images:
+            - name: quay.io/ansible/awx-operator
+              newTag: {{ awx_version }}
+            - name: gcr.io/kubebuilder/kube-rbac-proxy
+              newName: quay.io/brancz/kube-rbac-proxy
+              newTag: v0.15.0
+          namespace: {{ namespace }}
+        dest: "{{ deploy_dir }}/kustomization.yaml"
+
+    - name: Apply the AWX operator
+      # kustomize resolves the github.com resource in kustomization.yaml itself,
+      # so this also needs the proxy on hosts with no direct internet route.
+      shell: |
+        [ -f {{ proxy_env_file }} ] && . {{ proxy_env_file }}
+        {{ kubectl_cmd }} apply -k .
+      args:
+        chdir: "{{ deploy_dir }}"
+
+    - name: Wait for the AWX CRD to be established
+      command: "{{ kubectl_cmd }} wait --for=condition=Established crd/awxs.awx.ansible.com --timeout=120s"
+      changed_when: false
+
+    - name: Wait for the AWX operator deployment to be available
+      command: "{{ kubectl_cmd }} -n {{ namespace }} wait --for=condition=Available deployment/awx-operator-controller-manager --timeout=180s"
+      changed_when: false
+
+    - name: Apply TLS secret (idempotent)
+      # Use relative filenames + chdir rather than "{{ deploy_dir }}/tls.crt" directly:
+      # deploy_dir is "~/awx-deploy", and a quoted "~/..." passed straight to kubectl's
+      # --cert flag is never shell-expanded, so kubectl fails with "no such file".
+      shell: >
+        {{ kubectl_cmd }} create secret tls awx-tls
+        --cert="tls.crt"
+        --key="tls.key"
+        -n {{ namespace }}
+        --dry-run=client -o yaml
+        | {{ kubectl_cmd }} apply -f -
+      args:
+        chdir: "{{ deploy_dir }}"
+      register: tls_secret_apply
+      changed_when: "'unchanged' not in tls_secret_apply.stdout"
+
+    - name: Apply the AWX custom resource
+      command: "{{ kubectl_cmd }} apply -f awx.yml"
+      args:
+        chdir: "{{ deploy_dir }}"
+
+    - name: Wait for the AWX operator to create the Deployments
+      # kubectl wait needs the object to already exist; it does not wait for
+      # creation. The operator creates one Deployment per component (there is
+      # no Deployment named exactly "{{ awx_instance_name }}"), asynchronously
+      # from its reconcile loop after the CR is applied, which can take
+      # anywhere from seconds to a couple of minutes.
+      command: "{{ kubectl_cmd }} -n {{ namespace }} get deployment/{{ awx_instance_name }}-{{ item }}"
+      loop:
+        - web
+        - task
+      register: awx_deployment_created
+      until: awx_deployment_created.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Wait for the AWX deployments to be available
+      # Generous timeout: the migration job these depend on runs AWX's full
+      # Django migration set and can take several minutes on a slower host.
+      command: "{{ kubectl_cmd }} -n {{ namespace }} wait --for=condition=Available deployment/{{ awx_instance_name }}-{{ item }} --timeout=600s"
+      loop:
+        - web
+        - task
+      changed_when: false
+
+    - name: Create Ingress configuration
+      copy:
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: awx-ingress
+            namespace: {{ namespace }}
+            annotations:
+              traefik.ingress.kubernetes.io/router.entrypoints: websecure
+          spec:
+            ingressClassName: traefik
+            tls:
+              - hosts:
+                  - {{ hostname }}
+                secretName: awx-tls
+            rules:
+              - host: {{ hostname }}
+                http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: awx-service
+                          port:
+                            number: 80
+        dest: "{{ deploy_dir }}/awx-ingress-tls.yaml"
+
+    - name: Apply Ingress configuration
+      command: "{{ kubectl_cmd }} apply -f awx-ingress-tls.yaml"
+      args:
+        chdir: "{{ deploy_dir }}"
+
+    - name: Display completion message
+      debug:
+        msg: "AWX deployment completed successfully!"

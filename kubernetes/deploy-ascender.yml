@@ -1,0 +1,350 @@
+---
+# Deploys Ascender (Ctrl IQ's AWX fork, https://github.com/ctrliq/ascender) onto the same
+# K3s cluster that deploy-awx.yml sets up, in its own namespace, using Ascender's own
+# documented installer (github.com/ctrliq/ascender-install) rather than a hand-rolled
+# kustomize+CR flow. Unlike AWX, Ascender does not document a manual kustomize/operator
+# path, so this playbook drives its installer instead of reimplementing it.
+#
+# The installer (ascender-install/setup.sh) is itself an Ansible-based tool that expects
+# to run ON a host that already has a working kubeconfig for the target cluster (it reads
+# $HOME/.kube/config), so this playbook clones it onto the K3s node itself and runs it
+# there, the same way deploy-awx.yml runs kubectl/kustomize directly on that host rather
+# than from the controller.
+- name: Deploy Ascender on the existing K3s cluster
+  hosts: ascender_host
+  gather_facts: false
+  vars_prompt:
+    - name: hostname
+      prompt: "Enter the hostname (e.g., ascender.example.com)"
+      private: false
+
+    - name: ascender_version
+      prompt: "Enter the Ascender version (e.g., 25.6.0); also used for the Ascender Operator version"
+      private: false
+
+    - name: admin_password
+      prompt: "Choose an Ascender admin password"
+      private: true
+
+    - name: ldap_bind_password
+      prompt: "Enter the LDAP bind password"
+      private: true
+
+    - name: use_script_folder
+      prompt: "Are the certificate and key files located in the playbook folder? (y/n)"
+      private: false
+
+    - name: cert_file_input
+      prompt: "Enter the certificate file name or path (on this machine, not the remote host)"
+      private: false
+
+    - name: key_file_input
+      prompt: "Enter the key file name or path (on this machine, not the remote host)"
+      private: false
+
+  vars:
+    namespace: ascender
+    # Optional shell snippet on the target host that exports http_proxy/https_proxy/no_proxy.
+    # Sourced before tasks that reach the internet (k3s install, kustomize, git clone),
+    # since Ansible's shell module never sources /etc/profile.d itself. Skipped if absent.
+    proxy_env_file: /etc/profile.d/proxy.sh
+    # Paths below are resolved on the controller (where ansible-playbook runs), since
+    # vars_prompt is answered by whoever invokes the playbook, not the remote host.
+    cert_file: "{{ cert_file_input if use_script_folder|lower != 'y' else playbook_dir + '/' + cert_file_input }}"
+    key_file: "{{ key_file_input if use_script_folder|lower != 'y' else playbook_dir + '/' + key_file_input }}"
+    # Well-defined working directory on the remote host: holds the cloned ascender-install
+    # repo plus the cert/key it needs, mirroring deploy-awx.yml's deploy_dir.
+    deploy_dir: "~/ascender-deploy"
+    ascender_install_dir: "{{ deploy_dir }}/ascender-install"
+
+    # Mirrors kubernetes/awx.yml's LDAP block exactly, so Ascender authenticates against
+    # the same AD group as AWX. Ascender's installer has no declarative LDAP config
+    # of its own, so this is applied after install via the same Settings API AWX exposes
+    # (awx.yml's own comment notes AUTH_LDAP_GROUP_TYPE has to be set this way too).
+    ldap_settings:
+      AUTH_LDAP_SERVER_URI: "ldaps://ldap.example.com:636"
+      AUTH_LDAP_BIND_DN: "CN=ldap-bind,CN=Users,DC=ad,DC=example,DC=com"
+      AUTH_LDAP_BIND_PASSWORD: "{{ ldap_bind_password }}"
+      AUTH_LDAP_START_TLS: false
+      AUTH_LDAP_USER_SEARCH:
+        - "DC=ad,DC=example,DC=com"
+        - "SCOPE_SUBTREE"
+        - "(&(objectClass=user)(sAMAccountName=%(user)s))"
+      AUTH_LDAP_USER_ATTR_MAP:
+        email: mail
+        first_name: givenName
+        last_name: sn
+      AUTH_LDAP_GROUP_SEARCH:
+        - "OU=Groups,DC=ad,DC=example,DC=com"
+        - "SCOPE_SUBTREE"
+        - "(objectClass=group)"
+      AUTH_LDAP_GROUP_TYPE: "MemberDNGroupType"
+      AUTH_LDAP_GROUP_TYPE_PARAMS:
+        member_attr: member
+        name_attr: cn
+      AUTH_LDAP_REQUIRE_GROUP: "CN=AWX-Admins,OU=Groups,DC=ad,DC=example,DC=com"
+      AUTH_LDAP_DENY_GROUP: null
+      AUTH_LDAP_USER_FLAGS_BY_GROUP:
+        is_superuser:
+          - "CN=AWX-Admins,OU=Groups,DC=ad,DC=example,DC=com"
+      AUTH_LDAP_ORGANIZATION_MAP:
+        Example:
+          admins: "CN=AWX-Admins,OU=Groups,DC=ad,DC=example,DC=com"
+          remove_admins: false
+          users: true
+          remove_users: false
+      AUTH_LDAP_TEAM_MAP:
+        SysAdmins:
+          organization: Example
+          users: "CN=AWX-Admins,OU=Groups,DC=ad,DC=example,DC=com"
+          remove: false
+
+    # Mirrors kubernetes/awx.yml's AWX_TASK_ENV proxy extra_settings, so jobs run under
+    # Ascender see the same outbound proxy AWX's job pods do.
+    proxy_settings:
+      HTTP_PROXY: "http://proxy.example.com:3128"
+      HTTPS_PROXY: "http://proxy.example.com:3128"
+      NO_PROXY: "localhost,127.0.0.1,.example.com,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+  tasks:
+    - name: Check if K3s kubeconfig exists
+      stat:
+        path: /etc/rancher/k3s/k3s.yaml
+      register: k3s_kubeconfig
+
+    - name: Fail if K3s is not already set up
+      fail:
+        msg: >-
+          No K3s cluster found at /etc/rancher/k3s/k3s.yaml. This playbook deploys Ascender
+          onto the existing cluster deploy-awx.yml sets up; run that first (or install K3s
+          yourself) before deploying Ascender.
+      when: not k3s_kubeconfig.stat.exists
+
+    - name: Check if git is installed
+      command: which git
+      register: git_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install git (required to fetch the Ascender installer)
+      package:
+        name: git
+        state: present
+      become: true
+      when: git_check.rc != 0
+
+    - name: Check if certificate file exists (on the controller)
+      stat:
+        path: "{{ cert_file }}"
+      register: cert_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Check if key file exists (on the controller)
+      stat:
+        path: "{{ key_file }}"
+      register: key_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Fail if certificate or key file not found
+      fail:
+        msg: "Certificate or key file not found at the specified path on this machine."
+      when: not cert_stat.stat.exists or not key_stat.stat.exists
+
+    - name: Create remote deploy directory
+      file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Copy certificate file to the remote host
+      copy:
+        src: "{{ cert_file }}"
+        dest: "{{ deploy_dir }}/ascender.crt"
+        mode: "0600"
+
+    - name: Copy key file to the remote host
+      copy:
+        src: "{{ key_file }}"
+        dest: "{{ deploy_dir }}/ascender.key"
+        mode: "0600"
+
+    - name: Clone the Ascender installer (skipped once already cloned; delete deploy_dir on the remote host to pick up a new ascender_version)
+      # ansible.builtin.git shells out without sourcing /etc/profile.d, same as the curl
+      # install in deploy-awx.yml, so this needs the proxy explicitly for the clone from
+      # github.com on hosts with no direct internet route. Pinned to the ascender_version
+      # tag (ascender-install is tagged in lockstep with Ascender/the operator) rather than
+      # main, so the installer version used here can't drift out from under this playbook.
+      # deploy_dir/ascender_install_dir start with "~", which Ansible's path-typed args
+      # (chdir, creates) expand via os.path.expanduser, but a shell/command string does
+      # not (a quoted "~" is never shell-expanded). Cloning to a relative name under
+      # chdir, same as deploy-awx.yml's "kubectl apply -k ." pattern, keeps this task's
+      # actual clone target and the creates/chdir/replace/copy tasks elsewhere that
+      # reference ascender_install_dir pointed at the same real path.
+      shell: |
+        [ -f {{ proxy_env_file }} ] && . {{ proxy_env_file }}
+        git clone --branch "{{ ascender_version }}" --depth 1 https://github.com/ctrliq/ascender-install.git ascender-install
+      args:
+        chdir: "{{ deploy_dir }}"
+        creates: "{{ ascender_install_dir }}/setup.sh"
+
+    # ascender-install's own inventory file already targets itself over a local connection
+    # (see ascender-install/inventory), so no inventory changes are needed here: it always
+    # runs against whatever host setup.sh is invoked on, which is this one.
+
+    - name: Work around a stale field name in ascender-install's k3s CR template
+      # Confirmed against ascender-install and ascender-operator 25.6.0 (both pinned by
+      # ascender_version here): the bundled ascender-deployment-k3s.yml template still
+      # writes spec.init_postgres_extra_commands, but the operator's CRD renamed that
+      # field to postgres_init_container_commands, so kubectl apply rejects the manifest
+      # setup.sh generates ("unknown field") for any install with no external postgres
+      # host. Rewrite the field name in place until upstream fixes it.
+      replace:
+        path: "{{ ascender_install_dir }}/playbooks/roles/ascender_install/templates/ascender-deployment/ascender-deployment-k3s.yml"
+        regexp: 'init_postgres_extra_commands'
+        replace: 'postgres_init_container_commands'
+
+    - name: Work around ascender-install's OS check rejecting Debian (only allowlists Ubuntu 24/26)
+      # Confirmed against ascender-install 25.6.0: playbooks/assertions.yml's "Verify
+      # Ubuntu OS Family architecture" task fires on ansible_os_family == "Debian" (which
+      # covers both Ubuntu and actual Debian) but only accepts
+      # ansible_distribution_major_version 24/26, i.e. Ubuntu's year-based numbering, so
+      # it hard-fails on real Debian. This host runs Debian 13 ("trixie"), and k3s itself
+      # is already known-good here (see deploy-awx.yml), so widen the allowlist rather
+      # than skip the check outright. Revisit if a future ascender-install release adds
+      # proper Debian support.
+      replace:
+        path: "{{ ascender_install_dir }}/playbooks/assertions.yml"
+        regexp: "ansible_distribution_major_version in \\['24', '26'\\]"
+        replace: "ansible_distribution_major_version in ['24', '26', '13']"
+
+    - name: Work around ascender-install having no Debian 13 entry in its package table
+      # Confirmed against ascender-install 25.6.0: playbooks/roles/common/vars/main.yml's
+      # common_packages.Debian only has keys 11, 24, 26 (Ubuntu's numbering plus a stale
+      # Debian 11 entry) - nothing for Debian 13, so the "Install necessary packages for
+      # Ubuntu/Debian" task's dict lookup errors outright once the OS-version assert above
+      # is widened to let Debian 13 through. There genuinely is no upstream Debian 13
+      # support here, unlike the two prior patches (those were narrow, verified bugs) -
+      # this fabricates one from the 24/26 list, dropping "kubectl" since
+      # add_kubernetes_repo is false above and kubectl already comes from deploy-awx.yml's
+      # k3s install. All packages confirmed present in this host's trixie mirror.
+      blockinfile:
+        path: "{{ ascender_install_dir }}/playbooks/roles/common/vars/main.yml"
+        insertafter: '^  Debian:$'
+        marker: "    # {mark} ANSIBLE MANAGED BLOCK - Debian 13 entry"
+        content: |2
+              13:
+                - jq
+                - python3-pip
+                - python3-setuptools
+                - python3-kubernetes
+
+    - name: Ensure /root/.kube exists
+      file:
+        path: /root/.kube
+        state: directory
+        mode: "0700"
+      become: true
+
+    # With kube_install/download_kubeconfig both false below, ascender-install expects a
+    # working kubeconfig at $HOME/.kube/config already; it never populates one itself for
+    # a cluster it didn't create. setup.sh runs as root (ansible_user=root in
+    # inventory.ini), so that's /root/.kube/config here.
+    - name: Point /root/.kube/config at the existing K3s cluster
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: /root/.kube/config
+        mode: "0600"
+        remote_src: true
+      become: true
+
+    - name: Generate the Ascender installer config for this run
+      # k8s_platform/kube_install/download_kubeconfig: use the existing K3s cluster as-is.
+      # firewalld_disable: false keeps firewalld running with the same ports/trusted
+      # sources deploy-awx.yml already opened (ascender-install's own defaults for
+      # k3s_firewalld_ports/k3s_firewalld_trusted_sources match those exactly), instead of
+      # the installer's default of stopping and disabling firewalld outright.
+      # LEDGER_INSTALL/PROXY_INSTALL: false since only Ascender itself was asked for.
+      # add_kubernetes_repo: false per default.config.yml's own documented guidance
+      # ("set this to false when kubectl is already served by a local mirror you have
+      # configured") - kubectl already comes from the k3s install in deploy-awx.yml, and
+      # this is not just an optimisation: the pkgs.k8s.io v1.28 repo the installer adds
+      # otherwise is signed with an OpenPGP v3 signature Debian trixie's crypto policy
+      # now rejects as insecure, which hard-fails "Add the Kubernetes deb repository".
+      copy:
+        dest: "{{ ascender_install_dir }}/custom.config.yml"
+        mode: "0600"
+        content: |
+          k8s_platform: k3s
+          kube_install: false
+          download_kubeconfig: false
+          add_kubernetes_repo: false
+          k8s_lb_protocol: https
+          firewalld_disable: false
+          tls_crt_path: "{{ deploy_dir }}/ascender.crt"
+          tls_key_path: "{{ deploy_dir }}/ascender.key"
+          ASCENDER_HOSTNAME: {{ hostname }}
+          ASCENDER_NAMESPACE: {{ namespace }}
+          ASCENDER_ADMIN_USER: admin
+          ASCENDER_ADMIN_PASSWORD: "{{ admin_password }}"
+          ASCENDER_VERSION: "{{ ascender_version }}"
+          ASCENDER_OPERATOR_VERSION: "{{ ascender_version }}"
+          ascender_setup_playbooks: false
+          LEDGER_INSTALL: false
+          PROXY_INSTALL: false
+      no_log: true
+
+    - name: Run the Ascender installer
+      # Installs the Ascender Operator via kustomize, applies the Ascender custom
+      # resource (fixed name ascender-app in {{ namespace }}), and polls the API until
+      # it's up. Generous async timeout: this can take 10-20 minutes, similar to AWX's
+      # migration job (see deploy-awx.yml).
+      shell: |
+        [ -f {{ proxy_env_file }} ] && . {{ proxy_env_file }}
+        ./setup.sh
+      args:
+        chdir: "{{ ascender_install_dir }}"
+      become: true
+      register: ascender_setup
+      async: 2400
+      poll: 30
+      changed_when: "'ASCENDER SUCCESSFULLY SETUP' in ascender_setup.stdout"
+
+    - name: Configure the same outbound proxy AWX's job pods use
+      uri:
+        url: "https://{{ hostname }}/api/v2/settings/jobs/"
+        method: PATCH
+        user: admin
+        password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          AWX_TASK_ENV: "{{ proxy_settings }}"
+        status_code: [200]
+      register: ascender_proxy_settings
+      until: ascender_proxy_settings.status == 200
+      retries: 6
+      delay: 10
+
+    - name: Configure LDAP authentication
+      uri:
+        url: "https://{{ hostname }}/api/v2/settings/ldap/"
+        method: PATCH
+        user: admin
+        password: "{{ admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body: "{{ ldap_settings }}"
+        status_code: [200]
+      register: ascender_ldap_settings
+      until: ascender_ldap_settings.status == 200
+      retries: 6
+      delay: 10
+      no_log: true
+
+    - name: Display completion message
+      debug:
+        msg: "Ascender deployment completed successfully! Browse to https://{{ hostname }}/ and log in as admin."
